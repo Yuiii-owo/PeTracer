@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+build/
+demo/
+analysis/
+petracer-out/
+*.exe
+*.dll
+*.log
+*.o
+*.zip

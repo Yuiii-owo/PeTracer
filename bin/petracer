@@ -1,0 +1,5 @@
+#!/bin/sh
+# Run PeTracer from this checkout without installing the package.
+SELF=$(readlink -f -- "$0" 2>/dev/null) || SELF=$0
+DIR=$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)
+PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m petracer "$@"

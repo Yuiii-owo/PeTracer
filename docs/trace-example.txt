@@ -1,0 +1,26 @@
+PeTracer trace: <target.exe>
+  timeout=20.0s  imports=on  syscalls=on
+  out=petracer-out/trace-example
+
+[  0.000s] AGENT  ready hooks=29 imports=45 image=shellcode_loader_x86_64.exe
+[  0.000s] IMPORT  EnterCriticalSection         a1=0x140008160 a2=0x3 a3=0x0 a4=0x0
+[  0.000s] IMPORT  LeaveCriticalSection         a1=0x140008160 a2=0x3 a3=0x0 a4=0x0
+[  0.001s] IMPORT  SetUnhandledExceptionFilter  a1=0x140001f80 a2=0x80 a3=0x110 a4=0x2
+[  0.001s] IMPORT  GetModuleHandleA             a1=0x140004000 a2=0x140004ab0 a3=0x2 a4=0x0
+[  0.001s] IMPORT  VirtualProtect               a1=0x21fd80 a2=0x115 a3=0x40 a4=0x21fd7c
+[  0.001s] SYSCALL NtProtectVirtualMemory       target_pid=212 base=0x21fd80 size=277 protect=0x40
+[  0.003s] SYSCALL NtTerminateProcess           target_pid=212 exit_code=0
+[  0.003s] SYSCALL NtQueryInformationProcess    class=7
+[  0.004s] SYSCALL NtQueryInformationProcess    class=12
+[  0.004s] SYSCALL NtOpenKey                    path=\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\AeDebug
+[  0.004s] SYSCALL NtCreateFile                 path=C:\windows\system32\winedbg.exe access=0x80100080 disposition=1
+[  0.004s] SYSCALL NtOpenFile                   path=C:\ access=0x100001
+[  0.004s] SYSCALL NtOpenFile                   path=C:\windows\ access=0x100001
+[  0.004s] SYSCALL NtOpenFile                   path=C:\windows\system32\ access=0x100001
+[  0.004s] SYSCALL NtCreateUserProcess          image=C:\windows\system32\winedbg.exe
+[  0.014s] SYSCALL NtTerminateProcess           target_pid=212 exit_code=3221225477
+[crash] wine: Unhandled page fault on read access to FFFFFFFFFFFFFFFF at address 00006FFFFFBB35CB (thread 00d8), starting debugger...
+
+summary: imports=5 syscalls=11 events=17 exit=5 duration=0.77s
+verdict: malicious (75/100)
+report : demo/trace-shellcode_loader/report.md
