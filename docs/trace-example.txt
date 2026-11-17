@@ -2,7 +2,7 @@ PeTracer trace: <target.exe>
   timeout=20.0s  imports=on  syscalls=on
   out=petracer-out/trace-example
 
-[  0.000s] AGENT  ready hooks=29 imports=45 image=shellcode_loader_x86_64.exe
+[  0.000s] AGENT  ready hooks=31 imports=45 image=shellcode_loader_x86_64.exe
 [  0.000s] IMPORT  EnterCriticalSection         a1=0x140008160 a2=0x3 a3=0x0 a4=0x0
 [  0.000s] IMPORT  LeaveCriticalSection         a1=0x140008160 a2=0x3 a3=0x0 a4=0x0
 [  0.001s] IMPORT  SetUnhandledExceptionFilter  a1=0x140001f80 a2=0x80 a3=0x110 a4=0x2

@@ -35,6 +35,7 @@ SYS_FIELDS = {
     "net.": ["address", "port", "host"],
     "sleep": ["ms"],
     "proc.query": ["class"],
+    "sys.query": ["class", "length"],
     "thread.setinfo": ["class"],
     "driver.load": ["path"],
 }
@@ -59,6 +60,20 @@ def _sys_detail(obj: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+class TraceClock:
+    """Shared relative-time origin for agent and Wine trace lines."""
+
+    def __init__(self) -> None:
+        self.t0: float | None = None
+        self.lock = threading.Lock()
+
+    def rel(self, ts: float) -> float:
+        with self.lock:
+            if self.t0 is None:
+                self.t0 = ts
+            return max(0.0, ts - self.t0)
+
+
 class TracePrinter:
     def __init__(
         self,
@@ -66,16 +81,21 @@ class TracePrinter:
         show_syscalls: bool = True,
         show_all: bool = False,
         no_crt: bool = False,
+        show_agent_syscalls: bool = True,
         limit: int = 5000,
         color: bool = True,
+        t0: float | None = None,
+        clock: TraceClock | None = None,
     ) -> None:
         self.show_imports = show_imports
         self.show_syscalls = show_syscalls
         self.show_all = show_all
         self.no_crt = no_crt
+        self.show_agent_syscalls = show_agent_syscalls
         self.limit = limit
         self.color = color
-        self.t0: float | None = None
+        self.t0: float | None = t0
+        self.clock = clock
         self.lines = 0
         self.import_calls = 0
         self.syscalls = 0
@@ -87,6 +107,8 @@ class TracePrinter:
 
     def _rel(self, obj: dict[str, Any]) -> float:
         ts = float(obj.get("ts") or 0) / 1000.0
+        if self.clock is not None:
+            return self.clock.rel(ts)
         if self.t0 is None:
             self.t0 = ts
         return max(0.0, ts - self.t0)
@@ -102,10 +124,10 @@ class TracePrinter:
             is_net = api in ("connect", "WSAConnect", "getaddrinfo") and type_ != "import.call"
 
             if type_ == "agent.ready":
-                self._rel(obj)
+                rel = self._rel(obj)
                 imported = obj.get("imports", 0)
                 text = (
-                    f"[{0.0:7.3f}s] "
+                    f"[{rel:7.3f}s] "
                     + self._label("AGENT  ", BOLD)
                     + f"ready hooks={obj.get('hooks', 0)} imports={imported} "
                     + f"image={obj.get('image', '?')}"
@@ -121,7 +143,7 @@ class TracePrinter:
                 if self.no_crt and any(marker in dll for marker in CRT_MARKERS):
                     return
             elif is_syscall:
-                if not self.show_syscalls:
+                if not self.show_syscalls or not self.show_agent_syscalls:
                     return
             elif is_net:
                 if not (self.show_syscalls or self.show_all):
@@ -157,6 +179,58 @@ class TracePrinter:
                       if self.color else f"... trace limit {self.limit} reached (use --limit 0 for unlimited)")
 
 
+def _wine_syscall_detail(api: str, args: str) -> str:
+    parts = args.split(",")
+    if api == "NtQuerySystemInformation" and len(parts) >= 3:
+        try:
+            return f"class=0x{int(parts[0], 16):x} length={int(parts[2], 16)}"
+        except ValueError:
+            pass
+    if api == "NtQuerySystemInformationEx" and len(parts) >= 5:
+        try:
+            return f"class=0x{int(parts[0], 16):x} length={int(parts[4], 16)}"
+        except ValueError:
+            pass
+    return f"args={args.strip()[:200]}"
+
+
+class WineSyscallPrinter:
+    """Print sample-process NT syscalls parsed from Wine's +syscall log."""
+
+    def __init__(
+        self,
+        color: bool = True,
+        limit: int = 0,
+        t0: float | None = None,
+        clock: TraceClock | None = None,
+    ) -> None:
+        self.color = color
+        self.limit = limit
+        self.t0: float | None = t0
+        self.clock = clock
+        self.calls = 0
+        self.lines = 0
+        self.lock = threading.Lock()
+
+    def __call__(self, ev: Any) -> None:
+        with self.lock:
+            if self.limit and self.lines >= self.limit:
+                return
+            api = str(ev.api or "")
+            args = str(ev.get("args") or "")
+            ts = float(ev.ts or 0.0)
+            if self.clock is not None:
+                rel = self.clock.rel(ts)
+            else:
+                if self.t0 is None:
+                    self.t0 = ts
+                rel = max(0.0, ts - self.t0)
+            label = f"{YELLOW}SYSCALL{RESET}" if self.color else "SYSCALL"
+            print(f"[{rel:7.3f}s] {label} {api:<28} {_wine_syscall_detail(api, args)}")
+            self.calls += 1
+            self.lines += 1
+
+
 def trace_sample(
     sample: Path,
     sample_args: list[str],
@@ -164,6 +238,11 @@ def trace_sample(
     timeout: float,
     printer: TracePrinter,
     keep_work: bool = False,
+    runtime_dirs: list[Path] | None = None,
+    wine_syscall: bool = False,
+    wine_syscall_filter: bool = False,
+    on_wine_syscall: object | None = None,
+    no_agent: bool = False,
 ):
     cfg = SandboxConfig(
         sample=Path(sample),
@@ -173,6 +252,11 @@ def trace_sample(
         trace_imports=True,
         on_agent_event=printer,
         keep_work=keep_work,
+        runtime_dirs=list(runtime_dirs or []),
+        wine_syscall=wine_syscall or wine_syscall_filter,
+        wine_syscall_filter=wine_syscall_filter,
+        on_wine_syscall=on_wine_syscall,
+        no_agent=no_agent,
         verbose=False,
     )
     result = run_sample(cfg)

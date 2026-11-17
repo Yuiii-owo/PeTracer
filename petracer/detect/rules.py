@@ -395,6 +395,7 @@ def analyze(events: list[Event], pe: PEInfo, meta: dict | None = None) -> Analys
         and (
             (e.type == "proc.query" and _hexint(e.get("class")) in (7, 0x1E, 0x1F, 30, 31, 0x22))
             or (e.type == "thread.setinfo" and _hexint(e.get("class")) == 0x11)
+            or (e.type == "sys.query" and _hexint(e.get("class")) == 0x23)
         )
     ]
     static_anti = [x for x in pe.imports if x.lower() in ("isdebuggerpresent", "checkremotedebuggerpresent", "outputdebugstringa")]
@@ -409,6 +410,27 @@ def analyze(events: list[Event], pe: PEInfo, meta: dict | None = None) -> Analys
                 technique="T1622",
                 evidence=_evidence(analyzed, lambda e: e in anti),
                 detail=", ".join(sorted({e.type + ":" + str(e.get("class")) for e in anti})) or ", ".join(static_anti),
+            )
+        )
+
+    module_enum = [
+        e
+        for e in analyzed
+        if e.origin == "sample"
+        and e.type == "sys.query"
+        and _hexint(e.get("class")) == 0x0B
+    ]
+    if module_enum:
+        findings.append(
+            Finding(
+                rule_id="system_module_enum",
+                title="Kernel module enumeration",
+                severity="low",
+                weight=15,
+                description="The sample enumerated loaded kernel modules through NtQuerySystemInformation.",
+                technique="T1082",
+                evidence=_evidence(analyzed, lambda e: e in module_enum),
+                detail="SystemModuleInformation",
             )
         )
 

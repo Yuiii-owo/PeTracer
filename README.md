@@ -12,7 +12,7 @@
                                                    │
                          agent.jsonl ◄─────────────┘
                               │
-   WINEDEBUG(+loaddll,+process) + 靜態 PE 分析 ──► 規則引擎 ──► report.json / report.md
+   WINEDEBUG(+err,+loaddll,+process) + 靜態 PE 分析 ──► 規則引擎 ──► report.json / report.md
 ```
 
 ## 為什麼不需要 Windows ISO
@@ -30,10 +30,10 @@ Wine 本身就是 PE 載入器與 Windows 系統 DLL 的開源重實作（`ntdll
 | 隔離 | bwrap `--unshare-all`、唯讀 rootfs、tmpfs 遮蔽 `/home` `/root` `/run`、無網路、`--cap-drop ALL`、`--die-with-parent` | 一次性環境，逾時整組 SIGKILL |
 | syscall 限制 | 純 Python 產生的 seccomp BPF denylist（ptrace/mount/bpf/module/keyctl/userns/io_uring…） | 違規呼叫得到 `EPERM` |
 | Windows API Hook | `petracer_launch.exe` 以 `CREATE_SUSPENDED` 建立樣本，`CreateRemoteThread(LoadLibraryW)` 注入 `petracer_agent.dll`；agent 用 **INT3 + VEH + TF 單步** 對 ntdll 掛鉤 | `agent.jsonl`（每個呼叫一行 JSON） |
-| Wine 追蹤 | `WINEDEBUG=+loaddll,+process`（`--wine-trace` 再加 `+file,+reg`，`--wine-syscall` 加 `+syscall`） | 模組載入、子程序建立、NT syscall 直方圖 |
-| 終端追蹤 | IAT stub + ntdll hook，即時輸出 IMPORT/SYSCALL 順序 | 終端機 + `agent.jsonl` |
+| Wine 追蹤 | `WINEDEBUG=+err,+loaddll,+process`（`--wine-trace` 再加 `+file,+reg`，`--wine-syscall` 加 `+syscall,+timestamp`） | 模組載入、子程序建立、NT syscall 直方圖 |
+| 終端追蹤 | IAT stub + ntdll hook（可切換 Wine `+syscall`），即時輸出 IMPORT/SYSCALL 順序 | 終端機 + `agent.jsonl` |
 | 靜態分析 | 自寫 PE parser：machine/sections/imports/overlay/packer/`syscall` 位元組掃描 | `sample.info.json` |
-| 檢測 | 18 條行為規則 + ATT&CK 對應 + 加權評分 | 判定 `clean / suspicious / malicious` |
+| 檢測 | 19 條行為規則 + ATT&CK 對應 + 加權評分 | 判定 `clean / suspicious / malicious` |
 | 產物 | 由 wrapper 在 Wine 結束後把 prefix 內新檔案複製出來 | `artifacts/` + SHA256 |
 
 ## 需求
@@ -85,10 +85,12 @@ report  : out2/report.md
 | `-t/--timeout` | wall-clock 逾時（秒），到期 SIGKILL 整個 process group |
 | `-o/--out` | 輸出目錄 |
 | `--wine-trace` | 加開 `WINEDEBUG=+file,+reg`（量大，僅除錯用） |
-| `--wine-syscall` | 加開 `WINEDEBUG=+syscall`：在 NT syscall 邊界統計/取樣（完整直方圖寫入 `report.json` 的 `stats.nt_syscalls`） |
+| `--wine-syscall` | 加開 `WINEDEBUG=+syscall,+timestamp`：在 NT syscall 邊界統計/取樣（完整直方圖寫入 `report.json` 的 `stats.nt_syscalls`）；也能看到繞過 ntdll 的 inline `syscall`，但量很大 |
+| `--wine-syscall-filter` | 搭配 `--wine-syscall`：只保留目標程序 thread 的 syscall，過濾 `events.jsonl`/統計並寫出 `syscalls.sample.log`；完整原始 log 仍在 `stderr.log` |
 | `--no-agent` | 只保留 WINEDEBUG 層（agent 建置失敗時的回退） |
 | `--no-bwrap` | 不隔離直接跑（**僅除錯**，會使用真實 prefix） |
 | `--no-seccomp` | 關閉 syscall denylist |
+| `--runtime-dir DIR` | 補齊樣本缺少的 DLL（可重複；預設 `~/.cache/petracer/runtime`），只寫入單次執行的 overlay，不動快取 prefix |
 | `--fail-on-malicious` | 判定 malicious 時 exit 3（CI 用） |
 | `--keep-work` | 保留暫存工作目錄 |
 
@@ -104,6 +106,9 @@ petracer sample.exe
 # 需要選項時用 trace 子命令（選項放在 target 之前）
 ./bin/petracer trace -t 10 --no-crt -o out sample.exe
 
+# SYSCALL 改由 Wine +syscall 提供（只含目標 process；IMPORT 仍由 agent 提供）
+./bin/petracer trace --syscall-source wine -o out sample.exe
+
 # 讓 `petracer` 直接可用
 export PATH="$PWD/bin:$PATH"
 # 或 pip install -e .
@@ -113,7 +118,7 @@ export PATH="$PWD/bin:$PATH"
 輸出範例（hello）：
 
 ```text
-[  0.000s] AGENT  ready hooks=29 imports=49 image=hello64.exe
+[  0.000s] AGENT  ready hooks=31 imports=49 image=hello64.exe
 [  0.000s] IMPORT  CreateFileW                  a1=0x140004068 a2=0x40000000 a3=0x0 a4=0x0
 [  0.000s] SYSCALL NtCreateFile                 path=C:\sandbox_hello.txt access=0x40100080 disposition=5
 [  0.000s] IMPORT  WriteFile                    a1=0x40 a2=0x140004092 a3=0x5 a4=0x21fe9c
@@ -127,9 +132,21 @@ verdict: clean (0/100)
 規則：
 
 - **IMPORT**：agent 對樣本 main module 的 IAT 逐項掛 stub（不是 hook 系統 DLL），因此只記錄「樣本透過自己的 import table」發出的呼叫；x64 會顯示前 4 個 register 參數，x86 只顯示函數名。
-- **SYSCALL**：來自 ntdll `Nt*` hook。Win32 呼叫會先印 IMPORT，再印它實際落入的 NT syscall（例如 `CreateFileW` → `NtCreateFile`）。
+- **SYSCALL**：預設來自 ntdll `Nt*` hook（包含 `NtQuerySystemInformation`/`NtQuerySystemInformationEx`）；`--syscall-source wine` 時改由 Wine `+syscall` 提供，可覆蓋 inline direct syscall。Win32 呼叫會先印 IMPORT，再印它實際落入的 NT syscall（例如 `CreateFileW` → `NtCreateFile`）。
 - **NET**：`connect`/`getaddrinfo`（ws2_32 hook）。
 - `--imports-only` / `--syscalls-only`、`--no-crt`（隱藏 ucrt/msvcrt/libgcc）、`--limit N`、`--all`。
+- `--wine-syscall` / `--wine-syscall-filter`：把 Wine 的 `SysCall`/`SysRet` 寫入 `stderr.log`；filter 只保留目標 process 的 thread，並輸出 `syscalls.sample.log`。
+- `--syscall-source wine`：終端 `SYSCALL` 改由 Wine `+syscall` 提供（只含目標 process），不再印 agent ntdll hook 的 SYSCALL；`IMPORT` 仍由 agent 提供。搭配 `--no-agent` 可得到沒有 agent hook 的純 Wine syscall trace（但沒有 IMPORT 行）。
+
+SYSCALL 來源比較：
+
+| source | 來源 | 優點 | 限制 |
+|---|---|---|---|
+| `agent`（預設） | ntdll `Nt*` INT3 hook | 參數/路徑已解析、單一事件流、規則可直接用 | 看不到 inline `syscall`，也不含未掛鉤的 `Nt*` |
+| `wine` | Wine `WINEDEBUG=+syscall,+timestamp` | 完整 syscall 覆蓋，包含 direct syscall；只印目標 process | 參數是原始值、量大、兩個來源的終端行序可能交錯；同毫秒內無法嚴格排序 |
+
+`wine` source 的時間戳來自 Wine 的 monotonic clock，並和 agent 共用 `TraceClock`；但 Wine/agent 時間戳都是毫秒級，同一毫秒內的多個呼叫仍可能顯示為相同時間。
+
 - 追蹤是即時的；完整事件仍寫入 `agent.jsonl`/`events.jsonl`，並照常產生 `report.md`。
 - 完整輸出範例：[docs/trace-example.txt](docs/trace-example.txt)。
 
@@ -158,6 +175,7 @@ out/
 ├── events.jsonl       正規化後事件（agent + WINEDEBUG + sandbox 事件）
 ├── stdout.log         樣本 stdout
 ├── stderr.log         Wine / WINEDEBUG / agent 診斷輸出
+├── syscalls.sample.log 只有目標 process 的 Wine syscall（--wine-syscall-filter）
 ├── artifacts/         樣本在 C: 新產生或修改的檔案（含 SHA256）
 ├── report.json        機器可讀判定與證據索引
 └── report.md          人讀報告（判定、規則、時間線、IOC）
@@ -177,7 +195,7 @@ agent 以 `INT3` 改寫函式入口，VEH 還原原始位元組、設定 Trap Fl
 
 偵測規避 / 網路：
 
-`NtQueryInformationProcess`、`NtSetInformationThread`、`NtDelayExecution`、`NtLoadDriver`、`ws2_32!connect`、`ws2_32!WSAConnect`、`ws2_32!getaddrinfo`
+`NtQueryInformationProcess`、`NtQuerySystemInformation`、`NtQuerySystemInformationEx`、`NtSetInformationThread`、`NtDelayExecution`、`NtLoadDriver`、`ws2_32!connect`、`ws2_32!WSAConnect`、`ws2_32!getaddrinfo`
 
 事件包含：`ts / pid / tid / type / api / caller / origin`，以及 `path / handle / target_pid / base / size / protect / address / port…`。`origin=sample` 表示呼叫堆疊中含樣本映像，`system` 代表 Wine 內部間接呼叫。
 
@@ -202,6 +220,7 @@ agent 以 `INT3` 改寫函式入口，VEH 還原原始位元組、設定 Trap Fl
 | `defense_tampering` | 40 | T1562.001 | Defender/防火牆/UAC/系統目錄遭修改 |
 | `mass_file_modification` | 45 | T1486 | 大量改寫/改名或勒索副檔名 |
 | `anti_debug` | 20 | T1622 | DebugPort/DebugObject/HideFromDebugger 或靜態反偵測 import |
+| `system_module_enum` | 15 | T1082 | `NtQuerySystemInformation(SystemModuleInformation)` 列舉核心模組 |
 | `long_sleep` | 10 | T1497.003 | 單次睡眠 ≥ 60 秒 |
 | `network_activity` | 20 | T1071 | connect / DNS |
 | `direct_syscall` | 30 | T1106 | 映像中含 inline `syscall`/`sysenter`/`int 2e` |
@@ -237,15 +256,50 @@ bwrap 實際參數（見 `petracer/sandbox.py`）：
 
 - **使用者態隔離，不是硬體 VM**：抵禦的是樣本對宿主檔案/網路/其他程序的存取；核心提權（kernel exploit）不在防護範圍，請搭配 VM 或專用主機分析高風險樣本。
 - **Wine 偵測**：樣本可用 `wine_get_version`、註冊表特徵、`ntdll` 位址等發現 Wine；PeTracer 目前不偽裝。
-- **Direct syscall**：目前以靜態掃描映像中的 `syscall` 位元組偵測；繞過 ntdll 的執行期呼叫在 PE 側沒有事件（Wine 的 Syscall User Dispatch 會處理，但不會回報給 agent）。
+- **Direct syscall**：agent 的 ntdll hook 抓不到 inline `syscall`；靜態掃描會回報 `direct_syscall`，執行期請加 `--wine-syscall`（Wine 的 SUD/dispatcher 會把 `SysCall`/`SysRet` 寫進 `stderr.log`）。因為量很大，PeTracer 預設不自動開啟，只會在靜態掃描到 `syscall` 位元組時提示。
 - **多執行緒競態**：INT3 掛鉤在還原位元組到重新掛鉤之間有極短窗口，其他執行緒可能漏記一次呼叫；不影響判定方向。
 - **GUI**：無 X/Wayland 時樣本可能建立視窗失敗；`--headless` 由 Wine 自行回退。
 - **32-bit**：需 `i686-w64-mingw32-gcc`；agent/launcher 以 `-static` 連結，避免 Wine prefix 缺少 `libgcc_s_dw2-1.dll`。
 - **Wine 版本**：hook 依賴 Wine builtin 的匯出函式；不同 Wine 版本可能少數函式缺失（agent 會跳過），但 `Nt*` 介面穩定。
-- **事件遺失**：agent 對 `WriteFile` 的日誌本身也會觸發 hook，已用 TLS guard 防止遞迴；高頻樣本仍可能因 8 KB 事件緩衝截斷。
+- **事件遺失**：agent 對 `WriteFile` 的日誌本身也會觸發 hook，已用 per-thread guard（thread-state table）防止遞迴；高頻樣本仍可能因 8 KB 事件緩衝截斷。
 - **日誌可被樣本竄改**：`Z:\tmp\petracer-out` 對樣本可寫（agent 需要寫入）；高對抗樣本可以修改/刪除 `agent.jsonl`。需要防竄改時請把輸出改為 pipe、或在樣本執行後立即唯讀化。
 - **IMPORT 行的範圍**：只涵蓋樣本 IAT；`GetProcAddress`/delay-load/自建 resolver（例如 shellcode 的 PEB walk）不會產生 IMPORT 行，但其 ntdll 呼叫仍可能出現在 SYSCALL 行。x64 只顯示前 4 個 register 參數。
-- **`+syscall` 體積**：hello 一個樣本就會產生約 4 萬行 syscall 記錄；PeTracer 只保留高訊號 syscall 的取樣事件（每種 200 筆）並另外保存完整直方圖，原始輸出仍在 `stderr.log`。
+- **`+syscall` 體積**：hello 一個樣本就會產生約 4 萬行 syscall 記錄；PeTracer 只保留高訊號 syscall 的取樣事件（每種 200 筆）並另外保存完整直方圖，原始輸出仍在 `stderr.log`。用 `--wine-syscall-filter` 可只保留目標 process 並輸出 `syscalls.sample.log`。
+
+## 常見問題
+
+### 樣本立即結束、`agent ready timeout`、events 為 0
+
+常見於 **MSVC Debug build**：它依賴 `VCRUNTIME140D.dll`、`ucrtbased.dll`，而 Wine 只自帶 release 版 CRT。Wine loader 會在 `main()` 之前以 `0xc0000135` 失敗，PeTracer 只會看到 `exit=53` 與 `agent did not report ready`；現在 `run`/`trace` 會把缺少的 DLL 名稱印成 warning，完整 loader 錯誤可在 `stderr.log` 查看。
+
+解法（擇一）：
+
+1. 改用 Release build（例如 CMake 的 `RelWithDebInfo`/`Release`）。
+2. 建立 runtime DLL 目錄（推薦）：
+   ```bash
+   mkdir -p ~/.cache/petracer/runtime
+   cp /mnt/c/Windows/System32/vcruntime140d.dll \
+      /mnt/c/Windows/System32/ucrtbased.dll \
+      ~/.cache/petracer/runtime/
+   ```
+   之後 `run`/`trace` 會自動把樣本缺少的 DLL 注入該次執行的 `C:\windows\system32` overlay；快取 prefix 不會被修改，`petracer init --force` 也不會清掉。也可以每次用 `--runtime-dir DIR` 指定（可重複，後面的目錄優先）。只會補樣本 import table 中、Wine/prefix 沒有的 DLL，不會覆蓋 `kernel32.dll` 等內建 DLL。
+
+### Agent 沒抓到某個 ntdll API / inline syscall
+
+- Agent 只對固定的高訊號 `Nt*` 函式掛 INT3；不在列表中的 API 不會有事件。
+- 樣本若用 `GetProcAddress` 動態解析，仍然會命中 agent 的 ntdll hook；若直接執行 `syscall`/`sysenter`/`int 2e`，agent 不會看到。
+- 需要完整 NT syscall 覆蓋時用 Wine 的 `+syscall`：
+  ```bash
+  ./bin/petracer run --wine-syscall -o out sample.exe
+  grep 'SysCall' out/stderr.log | grep -i NtQuerySystemInformation
+  ```
+  Wine 的 SUD/dispatcher 會把 inline syscall 也導到同一層；代價是日誌量很大（本樣本約 1.9 萬行），而且包含 Wine 內部呼叫。
+- 只想看樣本程序自己的 syscall：
+  ```bash
+  ./bin/petracer run --wine-syscall-filter -o out sample.exe
+  ```
+  PeTracer 會用 agent 事件的 TID + `NtCreateUserProcess` 的 pid/tid 找出目標 process threads，過濾 `events.jsonl`/統計，並另外寫出 `syscalls.sample.log`；完整 log 仍在 `stderr.log`。目前只涵蓋目標 process，不含子程序；若某個 thread 只做 direct syscall、完全沒有 agent event，可能不會被列入 TID 集合。
+- `WINEDEBUG=+relay` 是 API relay，不是 syscall 層，抓不到 inline syscall。
 
 ## 設計取捨：為什麼不用 Frida
 
@@ -261,7 +315,7 @@ WINEDEBUG 仍然保留為零侵入的第二層（模組載入、子程序），`
 
 ```
 petracer/
-  agent/petracer_agent.c    # 注入 DLL：29 個 hooks、JSONL 事件
+  agent/petracer_agent.c    # 注入 DLL：31 個 hooks、JSONL 事件
   agent/petracer_launch.c   # suspended 啟動 + 注入 + 等 ready
   sandbox.py                # prefix、bwrap、逾時、事件收集
   seccomp.py                # 純 Python BPF 產生器

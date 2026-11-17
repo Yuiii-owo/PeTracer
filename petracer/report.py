@@ -106,6 +106,7 @@ def build_report(
             "duration": meta.get("duration"),
             "agent": meta.get("agent"),
             "agent_ready": meta.get("agent_ready"),
+            "syscall_filter": meta.get("syscall_filter", False),
             "bwrap": meta.get("bwrap"),
             "seccomp": meta.get("seccomp"),
             "wine": meta.get("wine"),
@@ -182,8 +183,17 @@ def render_markdown(report: dict) -> str:
     lines.append("")
     nt = stats.get("nt_syscalls") or {}
     if nt:
-        lines.append("### NT syscalls (WINEDEBUG +syscall)")
+        heading = "### NT syscalls (WINEDEBUG +syscall"
+        if execution.get("syscall_filter"):
+            heading += ", sample threads only"
+        heading += ")"
+        lines.append(heading)
         lines.append("")
+        if execution.get("syscall_filter"):
+            lines.append(
+                "_Full raw log: `stderr.log`; sample-only raw log: `syscalls.sample.log`._"
+            )
+            lines.append("")
         lines.append("| syscall | count |")
         lines.append("| --- | --- |")
         for name, count in list(nt.items())[:30]:

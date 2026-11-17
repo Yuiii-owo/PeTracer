@@ -1,8 +1,8 @@
 """Parser for Wine's WINEDEBUG trace channels.
 
-Enabled channels (default): +loaddll,+process.  They provide zero-instrumentation
-visibility into module loads and child processes, which complements the API hook
-layer inside the sample process.
+Enabled channels (default): +err,+loaddll,+process.  They provide zero-instrumentation
+visibility into loader failures, module loads and child processes, which complements
+the API hook layer inside the sample process.
 """
 from __future__ import annotations
 
@@ -11,13 +11,18 @@ import time
 
 from .events import Event, normalize_path
 
-RE_TID = re.compile(r"^([0-9a-fA-F]+):")
+RE_WINE_TS = re.compile(r"^(?P<ts>\d+\.\d+):")
+RE_TID = re.compile(r"^(?:\d+\.\d+:)?([0-9a-fA-F]+):")
 RE_LOADDLL = re.compile(
     r":trace:loaddll:[^\s]+ Loaded L\"(?P<path>.*?)\" at (?P<base>[0-9a-fA-F]+): (?P<kind>\w+)"
 )
 RE_NTCREATEPROCESS = re.compile(
     r":trace:process:NtCreateUserProcess L\"(?P<ntpath>.*?)\" image L\"(?P<image>.*?)\""
     r" cmdline L\"(?P<cmdline>.*?)\""
+)
+RE_NTCREATEPROCESS_ID = re.compile(
+    r":trace:process:NtCreateUserProcess L\"(?P<ntpath>.*?)\" pid (?P<pid>[0-9a-fA-F]+)"
+    r" tid (?P<child_tid>[0-9a-fA-F]+)"
 )
 RE_CREATEPROCESS = re.compile(
     r":trace:process:CreateProcessInternalW .*?cmdline L\"(?P<cmdline>.*?)\""
@@ -29,9 +34,14 @@ RE_SYSCALL = re.compile(r":SysCall\s+(?P<name>\w+)\((?P<args>.*)\)\s*$")
 
 
 def parse_line(line: str, ts: float | None = None) -> Event | None:
-    ts = ts if ts is not None else time.time()
     if ":trace:" not in line and ":SysCall" not in line:
         return None
+    if ts is None:
+        m_ts = RE_WINE_TS.match(line)
+        if m_ts:
+            # Wine's +timestamp is seconds since boot (CLOCK_MONOTONIC).
+            ts = float(m_ts.group("ts")) + (time.time() - time.monotonic())
+    ts = ts if ts is not None else time.time()
     tid = None
     m = RE_TID.match(line)
     if m:
@@ -70,6 +80,17 @@ def parse_line(line: str, ts: float | None = None) -> Event | None:
             except ValueError:
                 pass
         return Event(ts=ts, source="wine", type="wine.process", tid=tid, data=data, raw=line)
+
+    m = RE_NTCREATEPROCESS_ID.search(line)
+    if m:
+        data = {
+            "ntpath": normalize_path(m.group("ntpath").replace("\\\\", "\\")),
+            "pid": int(m.group("pid"), 16),
+            "child_tid": int(m.group("child_tid"), 16),
+        }
+        return Event(
+            ts=ts, source="wine", type="wine.process_id", tid=tid, data=data, raw=line
+        )
 
     m = RE_CREATEPROCESS.search(line)
     if m:

@@ -93,6 +93,12 @@ class RuleTests(unittest.TestCase):
         self.assertIn("anti_debug", ids)
         self.assertIn("long_sleep", ids)
 
+    def test_system_module_enum(self):
+        event = ev("sys.query", class_=0x0B)
+        event.data = {"class": "0xb", "length": 0}
+        result = analyze([event], pe())
+        self.assertIn("system_module_enum", {f.rule_id for f in result.findings})
+
     def test_driver_load(self):
         result = analyze([ev("driver.load", path="C:\\evil.sys")], pe())
         self.assertIn("driver_load", {f.rule_id for f in result.findings})

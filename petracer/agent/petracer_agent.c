@@ -81,8 +81,34 @@ static PVOID               g_main_base;
 static ULONG               g_main_size;
 static WCHAR               g_main_name[260];
 
-static __thread int  t_guard;
-static __thread void *t_step_addr;
+/* Wine does not reliably expand the PE TLS array for threads that already
+ * exist when the injected DLL is loaded; __thread access in the VEH then
+ * faults.  Keep the tiny per-thread guard/step state in a table instead. */
+#define MAX_THREAD_STATES 64
+typedef struct {
+    volatile LONG tid;
+    volatile LONG guard;
+    void *step_addr;
+} thread_state_t;
+static thread_state_t g_thread_states[MAX_THREAD_STATES];
+static thread_state_t g_thread_fallback;
+
+static thread_state_t *thread_state(void)
+{
+    DWORD tid = GetCurrentThreadId();
+    LONG self = (LONG)tid;
+    int i;
+    for (i = 0; i < MAX_THREAD_STATES; i++) {
+        if (g_thread_states[i].tid == self)
+            return &g_thread_states[i];
+    }
+    for (i = 0; i < MAX_THREAD_STATES; i++) {
+        if (g_thread_states[i].tid == 0 &&
+            InterlockedCompareExchange(&g_thread_states[i].tid, self, 0) == 0)
+            return &g_thread_states[i];
+    }
+    return &g_thread_fallback;
+}
 
 #define MAX_HOOKS 64
 typedef void (*hook_fn)(CONTEXT *);
@@ -394,12 +420,14 @@ static void write_line(const char *s, size_t n)
 {
     DWORD wrote;
     int old;
+    thread_state_t *ts;
     if (g_log == INVALID_HANDLE_VALUE || !g_lock_ready || !n) return;
+    ts = thread_state();
     EnterCriticalSection(&g_lock);
-    old = t_guard;
-    t_guard = 1;
+    old = ts->guard;
+    ts->guard = 1;
     WriteFile(g_log, s, (DWORD)n, &wrote, NULL);
-    t_guard = old;
+    ts->guard = old;
     LeaveCriticalSection(&g_lock);
 }
 
@@ -650,10 +678,12 @@ static int query_object_path(HANDLE h, WCHAR *out, size_t cap)
     unsigned char buf[4096];
     ULONG ret = 0;
     int saved;
+    thread_state_t *ts;
     if (!g_NtQueryObject || !out || cap < 2) return 0;
     out[0] = 0;
-    saved = t_guard;
-    t_guard = 1;
+    ts = thread_state();
+    saved = ts->guard;
+    ts->guard = 1;
     if (g_NtQueryObject(h, PT_OBJ_NAME_INFORMATION, buf, sizeof(buf), &ret) >= 0) {
         PT_US *us = (PT_US *)buf;
         if (us->Buffer && us->Length) {
@@ -665,7 +695,7 @@ static int query_object_path(HANDLE h, WCHAR *out, size_t cap)
             ntpath_to_dos(raw, out, cap);
         }
     }
-    t_guard = saved;
+    ts->guard = saved;
     return out[0] != 0;
 }
 
@@ -674,10 +704,12 @@ static int query_key_path(HANDLE h, WCHAR *out, size_t cap)
     unsigned char buf[4096];
     ULONG ret = 0;
     int saved;
+    thread_state_t *ts;
     if (!g_NtQueryKey || !out || cap < 2) return 0;
     out[0] = 0;
-    saved = t_guard;
-    t_guard = 1;
+    ts = thread_state();
+    saved = ts->guard;
+    ts->guard = 1;
     if (g_NtQueryKey(h, PT_KEY_NAME_INFORMATION, buf, sizeof(buf), &ret) >= 0) {
         ULONG len = *(ULONG *)buf;
         if (len > 0 && len + 4 <= sizeof(buf)) {
@@ -687,7 +719,7 @@ static int query_key_path(HANDLE h, WCHAR *out, size_t cap)
             out[chars] = 0;
         }
     }
-    t_guard = saved;
+    ts->guard = saved;
     return out[0] != 0;
 }
 
@@ -732,11 +764,12 @@ static DWORD handle_pid(HANDLE h)
     DWORD aux = 0;
     if (!h || h == (HANDLE)(ULONG_PTR)-1) return GetCurrentProcessId();
     {
-        int saved = t_guard;
+        thread_state_t *ts = thread_state();
+        int saved = ts->guard;
         DWORD pid;
-        t_guard = 1;
+        ts->guard = 1;
         pid = GetProcessId(h);
-        t_guard = saved;
+        ts->guard = saved;
         if (pid) return pid;
     }
     if (pending_lookup(h, 3, path, 8, &aux)) return aux;
@@ -1097,6 +1130,26 @@ static void h_NtQueryInformationProcess(CONTEXT *c)
     ev_end(&b);
 }
 
+static void h_NtQuerySystemInformation(CONTEXT *c)
+{
+    evb b;
+    char buf[8192];
+    ev_init(&b, buf, sizeof(buf), "sys.query", "NtQuerySystemInformation", c);
+    ev_hex(&b, "class", arg32(c, 1));
+    ev_num(&b, "length", arg32(c, 3));
+    ev_end(&b);
+}
+
+static void h_NtQuerySystemInformationEx(CONTEXT *c)
+{
+    evb b;
+    char buf[8192];
+    ev_init(&b, buf, sizeof(buf), "sys.query", "NtQuerySystemInformationEx", c);
+    ev_hex(&b, "class", arg32(c, 1));
+    ev_num(&b, "length", arg32(c, 5));
+    ev_end(&b);
+}
+
 static void h_NtSetInformationThread(CONTEXT *c)
 {
     evb b;
@@ -1180,6 +1233,7 @@ static LONG CALLBACK pt_veh(EXCEPTION_POINTERS *ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     void *addr = ep->ExceptionRecord->ExceptionAddress;
+    thread_state_t *ts = thread_state();
 
     if (code == EXCEPTION_BREAKPOINT) {
         int i;
@@ -1190,16 +1244,16 @@ static LONG CALLBACK pt_veh(EXCEPTION_POINTERS *ep)
         if (!h) return EXCEPTION_CONTINUE_SEARCH;
         *(BYTE *)addr = h->orig;
         ep->ContextRecord->EFlags |= 0x100;
-        if (!t_guard) h->fn(ep->ContextRecord);
+        if (!ts->guard) h->fn(ep->ContextRecord);
         /* must be recorded after the handler: the handler may itself call
-         * hooked APIs and consume the TLS slot for its own single-step */
-        t_step_addr = addr;
+         * hooked APIs and consume the thread state for its own single-step */
+        ts->step_addr = addr;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    if (code == EXCEPTION_SINGLE_STEP && t_step_addr) {
-        void *a = t_step_addr;
-        t_step_addr = NULL;
+    if (code == EXCEPTION_SINGLE_STEP && ts->step_addr) {
+        void *a = ts->step_addr;
+        ts->step_addr = NULL;
         *(BYTE *)a = 0xCC;
         ep->ContextRecord->EFlags &= ~0x100;
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -1213,14 +1267,16 @@ static void install(const char *dll, const char *name, hook_fn fn)
     void *addr;
     DWORD old;
     int saved;
+    thread_state_t *ts;
     if (!m || g_hook_count >= MAX_HOOKS || g_hook_count >= g_hook_limit) return;
     addr = (void *)GetProcAddress(m, name);
     if (!addr) return;
     /* keep the page writable: the VEH must never call VirtualProtect(),
      * because that itself may hit a hook. */
-    saved = t_guard;
-    t_guard = 1;
-    if (!VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &old)) { t_guard = saved; return; }
+    ts = thread_state();
+    saved = ts->guard;
+    ts->guard = 1;
+    if (!VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &old)) { ts->guard = saved; return; }
     g_hooks[g_hook_count].dll = dll;
     g_hooks[g_hook_count].name = name;
     g_hooks[g_hook_count].addr = addr;
@@ -1228,7 +1284,7 @@ static void install(const char *dll, const char *name, hook_fn fn)
     g_hooks[g_hook_count].fn = fn;
     g_hook_count++;
     *(BYTE *)addr = 0xCC;
-    t_guard = saved;
+    ts->guard = saved;
 }
 
 static void install_all(void)
@@ -1256,6 +1312,8 @@ static void install_all(void)
     install("ntdll.dll", "NtCreateUserProcess", h_NtCreateUserProcess);
     install("ntdll.dll", "NtTerminateProcess", h_NtTerminateProcess);
     install("ntdll.dll", "NtQueryInformationProcess", h_NtQueryInformationProcess);
+    install("ntdll.dll", "NtQuerySystemInformation", h_NtQuerySystemInformation);
+    install("ntdll.dll", "NtQuerySystemInformationEx", h_NtQuerySystemInformationEx);
     install("ntdll.dll", "NtSetInformationThread", h_NtSetInformationThread);
     install("ntdll.dll", "NtDelayExecution", h_NtDelayExecution);
     install("ntdll.dll", "NtLoadDriver", h_NtLoadDriver);
@@ -1317,10 +1375,11 @@ static DWORD WINAPI pt_init(LPVOID unused)
     install_all();
 #endif
     if (g_trace_imports) {
-        int saved = t_guard;
-        t_guard = 1;
+        thread_state_t *ts = thread_state();
+        int saved = ts->guard;
+        ts->guard = 1;
         install_imports();
-        t_guard = saved;
+        ts->guard = saved;
     }
 
     sb_init(&b, buf, sizeof(buf));

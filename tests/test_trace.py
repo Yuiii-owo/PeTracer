@@ -2,10 +2,11 @@ import contextlib
 import io
 import unittest
 
-from petracer.trace import TracePrinter
+from petracer.events import Event
+from petracer.trace import TracePrinter, WineSyscallPrinter
 
 EVENTS = [
-    {"seq": 1, "ts": 1000, "type": "agent.ready", "hooks": 29, "imports": 49, "image": "x.exe"},
+    {"seq": 1, "ts": 1000, "type": "agent.ready", "hooks": 31, "imports": 49, "image": "x.exe"},
     {"seq": 2, "ts": 1001, "type": "import.call", "api": "CreateFileW",
      "dll": "KERNEL32.dll", "a1": "0x1", "a2": "0x2", "a3": "0x3", "a4": "0x4"},
     {"seq": 3, "ts": 1002, "type": "file.create", "api": "NtCreateFile",
@@ -32,6 +33,36 @@ class TracePrinterTests(unittest.TestCase):
         self.assertEqual(printer.import_calls, 2)
         self.assertEqual(printer.syscalls, 1)
 
+    def test_hide_agent_syscalls(self):
+        printer = TracePrinter(color=False, show_agent_syscalls=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            for ev in EVENTS:
+                printer(ev)
+        out = buf.getvalue()
+        self.assertIn("IMPORT  CreateFileW", out)
+        self.assertNotIn("SYSCALL NtCreateFile", out)
+        self.assertEqual(printer.syscalls, 0)
+
+    def test_wine_syscall_printer(self):
+        printer = WineSyscallPrinter(color=False)
+        ev = Event(
+            ts=1.0,
+            source="wine",
+            type="nt.syscall",
+            api="NtQuerySystemInformation",
+            tid=0xDC,
+            data={"args": "0000000b,00000000,00000000,00000000"},
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            printer(ev)
+        out = buf.getvalue()
+        self.assertIn("SYSCALL NtQuerySystemInformation", out)
+        self.assertIn("class=0xb", out)
+        self.assertIn("length=0", out)
+        self.assertEqual(printer.calls, 1)
+
     def test_no_crt(self):
         _, out = self.render(no_crt=True)
         self.assertNotIn("memcpy", out)
@@ -41,6 +72,21 @@ class TracePrinterTests(unittest.TestCase):
         _, out = self.render(show_imports=False)
         self.assertNotIn("IMPORT", out)
         self.assertIn("SYSCALL", out)
+
+    def test_system_query_detail(self):
+        printer = TracePrinter(color=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            printer({
+                "ts": 1000,
+                "type": "sys.query",
+                "api": "NtQuerySystemInformation",
+                "class": "0xb",
+                "length": 0,
+            })
+        out = buf.getvalue()
+        self.assertIn("SYSCALL NtQuerySystemInformation", out)
+        self.assertIn("class=0xb", out)
 
     def test_limit(self):
         printer, out = self.render(limit=2)

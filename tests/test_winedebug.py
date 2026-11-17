@@ -27,6 +27,26 @@ class WineDebugParserTests(unittest.TestCase):
         self.assertEqual(ev.data["image"], "C:\\windows\\system32\\cmd.exe")
         self.assertIn("echo x", ev.data["cmdline"])
 
+    def test_ntcreateuserprocess_ids(self):
+        line = (
+            '0024:trace:process:NtCreateUserProcess L"\\\\??\\\\Z:\\\\tmp\\\\sample\\\\x.exe" '
+            'pid 00d8 tid 00dc handles 0x44/0x48'
+        )
+        ev = parse_line(line)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.type, "wine.process_id")
+        self.assertEqual(ev.data["ntpath"], "Z:\\tmp\\sample\\x.exe")
+        self.assertEqual(ev.data["pid"], 0xD8)
+        self.assertEqual(ev.data["child_tid"], 0xDC)
+
+    def test_timestamped_syscall(self):
+        ev = parse_line('7474.552:002c:SysCall  NtOpenFile(1,2,3,4,5,6)')
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.type, "nt.syscall")
+        self.assertEqual(ev.api, "NtOpenFile")
+        self.assertEqual(ev.tid, 0x2C)
+        self.assertGreater(ev.ts, 0)
+
     def test_ignores_noise(self):
         self.assertIsNone(parse_line("MESA-EGL: warning: something"))
         self.assertIsNone(parse_line("0024:trace:seh:something"))

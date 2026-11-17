@@ -14,7 +14,13 @@ from .events import Event
 from .pe import parse_pe
 from .report import build_report, load_report_inputs, write_report
 from .sandbox import SandboxConfig, SandboxError, ensure_prefix, run_sample, wine_version
-from .trace import TracePrinter, print_anomalies, trace_sample
+from .trace import (
+    TraceClock,
+    TracePrinter,
+    WineSyscallPrinter,
+    print_anomalies,
+    trace_sample,
+)
 
 GREEN, RED, ORANGE, RESET, DIM = "\033[32m", "\033[31m", "\033[33m", "\033[0m", "\033[2m"
 
@@ -41,6 +47,8 @@ def _print_summary(result, analysis: Analysis, report_path: Path, quiet: bool) -
         print("findings: none")
     print(f"report  : {report_path}")
     print(f"events  : {result.out_dir / 'events.jsonl'}")
+    if result.meta.get("syscall_filter"):
+        print(f"syscalls: {result.out_dir / 'syscalls.sample.log'} (sample threads only)")
     for w in result.warnings:
         print(f"warning : {w}", file=sys.stderr)
 
@@ -71,12 +79,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         out_dir=out_dir,
         timeout=args.timeout,
         wine_trace=args.wine_trace,
-        wine_syscall=args.wine_syscall,
+        wine_syscall=args.wine_syscall or args.wine_syscall_filter,
+        wine_syscall_filter=args.wine_syscall_filter,
         no_agent=args.no_agent,
         no_bwrap=args.no_bwrap,
         use_seccomp=not args.no_seccomp,
         keep_work=args.keep_work,
         prefix=Path(args.prefix) if args.prefix else None,
+        runtime_dirs=[Path(p) for p in args.runtime_dir],
         verbose=not args.quiet,
     )
     try:
@@ -140,37 +150,63 @@ def cmd_trace(args: argparse.Namespace) -> int:
     out_dir = Path(args.out) if args.out else Path("petracer-out") / (
         f"trace-{target.stem}-{time.strftime('%Y%m%d-%H%M%S')}"
     )
+    source = args.syscall_source
+    clock = TraceClock()
+    wine_printer = None
+    if source == "wine" and not args.imports_only:
+        wine_printer = WineSyscallPrinter(
+            color=not args.no_color and sys.stdout.isatty(),
+            limit=args.limit,
+            clock=clock,
+        )
     printer = TracePrinter(
         show_imports=not args.syscalls_only,
         show_syscalls=not args.imports_only,
         show_all=args.all,
         no_crt=args.no_crt,
+        show_agent_syscalls=wine_printer is None,
         limit=args.limit,
         color=not args.no_color and sys.stdout.isatty(),
+        clock=clock,
     )
+    imports_on = printer.show_imports and not args.no_agent
     print(f"PeTracer trace: {target}")
-    print(f"  timeout={args.timeout}s  imports={'on' if printer.show_imports else 'off'}  "
-          f"syscalls={'on' if printer.show_syscalls else 'off'}")
+    print(f"  timeout={args.timeout}s  imports={'on' if imports_on else 'off'}  "
+          f"syscalls={'on' if printer.show_syscalls else 'off'}  source={source}")
     print(f"  out={out_dir}")
     print()
     try:
         result, analysis = trace_sample(
-            target, list(args.target_args), out_dir, args.timeout, printer, args.keep_work
+            target, list(args.target_args), out_dir, args.timeout, printer, args.keep_work,
+            runtime_dirs=[Path(p) for p in args.runtime_dir],
+            wine_syscall=args.wine_syscall or source == "wine",
+            wine_syscall_filter=args.wine_syscall_filter or source == "wine",
+            on_wine_syscall=wine_printer,
+            no_agent=args.no_agent,
         )
     except (SandboxError, build.BuildError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print_anomalies(result)
+    for warning in result.warnings:
+        # the agent warning is printed below, next to the trace summary
+        if warning.startswith("agent did not report ready"):
+            continue
+        print(f"warning: {warning}", file=sys.stderr)
     print()
+    syscall_count = wine_printer.calls if wine_printer is not None else printer.syscalls
+    line_count = printer.lines + (wine_printer.lines if wine_printer is not None else 0)
     print(
-        f"summary: imports={printer.import_calls} syscalls={printer.syscalls} "
-        f"events={printer.lines} exit={result.exit_code} duration={result.duration:.2f}s"
+        f"summary: imports={printer.import_calls} syscalls={syscall_count} "
+        f"events={line_count} exit={result.exit_code} duration={result.duration:.2f}s"
         + (" TIMEOUT" if result.timed_out else "")
     )
-    if not result.agent_ready:
+    if not result.agent_ready and not args.no_agent:
         print("warning: agent did not become ready; import/syscall tracing unavailable", file=sys.stderr)
     print(f"verdict: {analysis.verdict} ({analysis.score}/100)")
     print(f"report : {out_dir / 'report.md'}")
+    if result.meta.get("syscall_filter"):
+        print(f"syscalls: {out_dir / 'syscalls.sample.log'} (sample threads only)")
     return 0
 
 
@@ -267,11 +303,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("-t", "--timeout", type=float, default=30.0, help="wall-clock timeout (seconds)")
     p_run.add_argument("--wine-trace", action="store_true", help="also enable WINEDEBUG +file,+reg")
     p_run.add_argument("--wine-syscall", action="store_true", help="enable WINEDEBUG +syscall (NT syscall boundary, heavy)")
+    p_run.add_argument(
+        "--wine-syscall-filter", action="store_true",
+        help="with --wine-syscall, keep only target-process syscalls in events/stats; "
+             "full log stays in stderr.log, filtered raw log goes to syscalls.sample.log",
+    )
     p_run.add_argument("--no-agent", action="store_true", help="disable the API hook agent")
     p_run.add_argument("--no-bwrap", action="store_true", help="run without bubblewrap (UNSAFE, debugging)")
     p_run.add_argument("--no-seccomp", action="store_true", help="disable the seccomp denylist")
     p_run.add_argument("--keep-work", action="store_true", help="keep the temporary run directory")
     p_run.add_argument("--prefix", help="override the Wine prefix")
+    p_run.add_argument(
+        "--runtime-dir", action="append", default=[], metavar="DIR",
+        help="inject imported DLLs from DIR into the sandbox (repeatable; default: ~/.cache/petracer/runtime)",
+    )
     p_run.add_argument("--quiet", action="store_true", help="print a single JSON line")
     p_run.add_argument("--fail-on-malicious", action="store_true", help="exit 3 when the verdict is malicious")
     p_run.set_defaults(func=cmd_run)
@@ -288,7 +333,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--all", action="store_true", help="also show non-syscall agent events")
     p_tr.add_argument("--limit", type=int, default=5000, help="max printed lines (0 = unlimited)")
     p_tr.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    p_tr.add_argument(
+        "--syscall-source", choices=("agent", "wine"), default="agent",
+        help="terminal SYSCALL source: agent ntdll hooks (default) or Wine +syscall (target process only)",
+    )
+    p_tr.add_argument("--no-agent", action="store_true", help="disable the API hook agent")
+    p_tr.add_argument("--wine-syscall", action="store_true", help="also enable WINEDEBUG +syscall (heavy)")
+    p_tr.add_argument(
+        "--wine-syscall-filter", action="store_true",
+        help="with --wine-syscall, keep only target-process syscalls and write syscalls.sample.log",
+    )
     p_tr.add_argument("--keep-work", action="store_true", help="keep the temporary run directory")
+    p_tr.add_argument(
+        "--runtime-dir", action="append", default=[], metavar="DIR",
+        help="inject imported DLLs from DIR into the sandbox (repeatable; default: ~/.cache/petracer/runtime)",
+    )
     p_tr.set_defaults(func=cmd_trace)
 
     p_rep = sub.add_parser("report", help="regenerate report.json/report.md for a run directory")
